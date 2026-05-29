@@ -1,0 +1,686 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "Pillow",
+#     # PyGObject >=3.50 uses meson and requires girepository-2.0, which is
+#     # only available on newer distros (Ubuntu 24.04+, Fedora 39+).  Older
+#     # distros ship girepository-1.0 and need <3.50 (setuptools-based build).
+#     # Remove the upper bound once you're on a distro with girepository-2.0.
+#     "PyGObject<3.50",
+#     "zeroconf",
+#     "requests",
+# ]
+# ///
+"""System tray indicator for discovering and controlling WLED lights.
+
+Discovers WLED devices on the local network via mDNS and presents them
+in a system tray menu.  Left-click toggles on/off, scroll wheel adjusts
+brightness.  Right-click opens a context menu to pin/unpin, toggle
+keep-alive, or open the device's web UI.
+
+Pinned devices appear at the top of the menu; others below a separator.
+
+Keep-alive ("managed") devices have their brightness maintained on a
+30-second heartbeat with a 1-minute WLED nightlight timer — if the
+indicator stops (suspend, logout, crash), the light auto-offs within
+a minute.  Managed state is independent of on/off: clicking off pauses
+heartbeats, clicking on resumes at the managed brightness.  Scroll
+adjusts the managed brightness (persisted).
+
+Config persists in ~/.config/wled-indicator/config.json.
+
+Prerequisites (system packages, not installed by uv):
+  - GTK 3 introspection:  libgirepository1.0-dev libcairo2-dev
+                           pkg-config python3-dev gcc gir1.2-gtk-3.0
+  - AppIndicator:          gir1.2-ayatanaappindicator3-0.1
+                           (or gir1.2-appindicator3-0.1)
+  On Ubuntu 22.04:  apt install libgirepository1.0-dev libcairo2-dev
+                    pkg-config python3-dev gcc gir1.2-gtk-3.0
+                    gir1.2-ayatanaappindicator3-0.1
+
+Usage:
+  uv run --script wled-indicator   # or just ./wled-indicator
+"""
+
+import atexit
+import dataclasses
+import json
+import logging
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import gi
+import requests
+from PIL import Image, ImageDraw
+from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator
+
+LOG = logging.getLogger(__name__)
+API_TIMEOUT = 2
+CONFIG_DIR = Path.home() / ".config" / "wled-indicator"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config() -> dict[str, Any]:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict[str, Any]):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, sort_keys=True))
+
+
+COLOR_ON = "#73d216"
+COLOR_OFF = "#888888"
+COLOR_WARN = "#f57900"
+COLOR_DIM = "#666666"
+COLOR_MANAGED = "#729fcf"
+
+
+DARK_CSS = b"""
+    menu, menuitem {
+        background-color: #2d2d2d;
+        color: #eeeeee;
+    }
+    menuitem label {
+        background: transparent;
+    }
+    menuitem:hover {
+        background-color: #404040;
+    }
+    separator {
+        background-color: #444444;
+    }
+"""
+
+
+def apply_dark_css():
+    css = Gtk.CssProvider()
+    css.load_from_data(DARK_CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(),
+        css,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+
+
+AKEMI_URL = "https://kno.wled.ge/assets/images/ui/akemi/001_cheerful.png"
+AKEMI_CACHE = CONFIG_DIR / "akemi.png"
+ICON_SIZE = 22
+
+
+def generate_icon_theme_dir() -> str:
+    """Return a directory containing the tray icon, downloading Akemi if needed."""
+    icon_dir = tempfile.mkdtemp(prefix="wled-indicator-")
+    atexit.register(shutil.rmtree, icon_dir, ignore_errors=True)
+    icon_path = os.path.join(icon_dir, "wled.png")
+
+    # Use cached source if available, otherwise download
+    if AKEMI_CACHE.exists():
+        source = AKEMI_CACHE
+    else:
+        try:
+            r = requests.get(AKEMI_URL, timeout=5)
+            r.raise_for_status()
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            AKEMI_CACHE.write_bytes(r.content)
+            source = AKEMI_CACHE
+        except requests.RequestException:
+            LOG.warning("Failed to download Akemi icon, using fallback")
+            img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+            ImageDraw.Draw(img).ellipse(
+                [2, 2, ICON_SIZE - 3, ICON_SIZE - 3],
+                fill=COLOR_WARN,
+            )
+            img.save(icon_path)
+            return icon_dir
+
+    img = Image.open(source)
+    img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+    img.save(icon_path)
+    return icon_dir
+
+
+def clamp_bri(bri: int) -> int:
+    return min(255, max(1, bri))
+
+
+@dataclasses.dataclass
+class WledDevice:
+    """WLED device abstraction."""
+
+    name: str
+    host: str
+    port: int = 80
+    ui_name: str = ""
+    on: bool = False
+    brightness: int = 128
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def __post_init__(self):
+        if not self.ui_name:
+            self.ui_name = self.name
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def refresh(self):
+        """Fetch full state including user-configured UI name."""
+        try:
+            r = requests.get(f"{self.base_url}/json", timeout=API_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            state = data.get("state", {})
+            with self.lock:
+                self.on = state.get("on", False)
+                self.brightness = state.get("bri", 128)
+                if ui := data.get("info", {}).get("name"):
+                    self.ui_name = ui
+        except requests.RequestException as e:
+            LOG.warning("Failed to refresh %s: %s", self.name, e)
+
+    def set_state(self, on: bool | None = None, bri: int | None = None):
+        payload: dict[str, Any] = {}
+        if on is not None:
+            payload["on"] = on
+        if bri is not None:
+            payload["bri"] = bri
+        try:
+            r = requests.post(
+                f"{self.base_url}/json/state", json=payload, timeout=API_TIMEOUT
+            )
+            r.raise_for_status()
+            state = r.json()
+            with self.lock:
+                self.on = state.get("on", self.on)
+                self.brightness = state.get("bri", self.brightness)
+        except requests.RequestException as e:
+            LOG.warning("Failed to update %s: %s", self.name, e)
+
+    def start_nightlight(self, target_bri: int):
+        """Start a 1-minute nightlight fade to the target brightness."""
+        if target_bri:
+            target_bri = clamp_bri(target_bri)
+        LOG.info("Nightlight %s: fade to %d", self.ui_name, target_bri)
+        try:
+            requests.get(
+                f"{self.base_url}/win&T=1&NL=1&NF=1&NT={target_bri}",
+                timeout=API_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            LOG.warning("Failed nightlight %s: %s", self.name, e)
+
+    def send_keepalive(self, bri: int):
+        """Set brightness with a 1-minute nightlight via the /win HTTP API.
+
+        Uses the legacy HTTP API rather than JSON — the /win endpoint
+        reliably resets the nightlight countdown on each call, whereas
+        the JSON API does not.
+        """
+        bri = clamp_bri(bri)
+        LOG.info("Keepalive %s: bri=%d", self.ui_name, bri)
+        try:
+            r = requests.get(
+                f"{self.base_url}/win&T=1&A={bri}&NL=1&NF=0", timeout=API_TIMEOUT
+            )
+            r.raise_for_status()
+            with self.lock:
+                self.on = True
+                self.brightness = bri
+        except requests.RequestException as e:
+            LOG.warning("Failed keepalive %s: %s", self.name, e)
+
+
+class DeviceManager(ServiceListener):
+    """mDNS discovery of WLED devices"""
+
+    def __init__(self):
+        self.devices: dict[str, WledDevice] = {}
+        self.lock = threading.Lock()
+        self.on_change: Callable[[], None] = lambda: None
+
+    def snapshot(self) -> list[WledDevice]:
+        with self.lock:
+            return list(self.devices.values())
+
+    def add_service(self, zc: Zeroconf, type_: str, name: str):
+        with self.lock:
+            if name in self.devices:
+                return  # already known — don't rebuild the menu
+        info = zc.get_service_info(type_, name)
+        if not info or not info.addresses:
+            return
+        host = socket.inet_ntoa(info.addresses[0])
+        port = info.port or 80
+        mdns_name = (
+            (info.server or name.split(".")[0]).rstrip(".").removesuffix(".local")
+        )
+        device = WledDevice(mdns_name, host, port)
+        device.refresh()
+        with self.lock:
+            self.devices[name] = device
+        LOG.info("Discovered %s (%s) at %s:%d", device.ui_name, mdns_name, host, port)
+        self.on_change()
+
+    def update_service(self, _zc: Zeroconf, _type: str, _name: str):
+        pass  # address changes are rare; refresh handles state
+
+    def remove_service(self, _zc: Zeroconf, _type: str, name: str):
+        with self.lock:
+            removed = self.devices.pop(name, None)
+        if removed:
+            LOG.info("Lost %s", removed.name)
+            self.on_change()
+
+
+def parse_scroll_direction(event: Gdk.Event) -> bool | None:
+    """Return True for up, False for down, None for ignore."""
+    if event.direction == Gdk.ScrollDirection.UP:
+        return True
+    if event.direction == Gdk.ScrollDirection.DOWN:
+        return False
+    if event.direction == Gdk.ScrollDirection.SMOOTH:
+        _, _, dy = event.get_scroll_deltas()
+        if dy < 0:
+            return True
+        if dy > 0:
+            return False
+    return None
+
+
+REDISCOVER_INTERVAL_S = 120
+HEARTBEAT_INTERVAL_S = 30
+
+
+class WledIndicator:
+    def __init__(self, manager: DeviceManager, zc: Zeroconf):
+        self.manager = manager
+        self.zc = zc
+        self.browser: ServiceBrowser | None = None
+        self.hovered_device: WledDevice | None = None
+        self.device_items: dict[str, Gtk.MenuItem] = {}
+        self._brightness_timers: dict[str, threading.Timer] = {}
+
+        cfg = load_config()
+        self.pinned: set[str] = set(cfg.get("pinned", []))
+        self.managed: dict[str, int] = cfg.get("managed", {})
+
+        apply_dark_css()
+
+        self.indicator = AppIndicator.Indicator.new(
+            "wled-indicator",
+            "wled",
+            AppIndicator.IndicatorCategory.HARDWARE,
+        )
+        self.indicator.set_icon_theme_path(generate_icon_theme_dir())
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self._start_browser()
+        self.rebuild_menu()
+        manager.on_change = lambda: GLib.idle_add(self._on_devices_changed)
+        GLib.timeout_add_seconds(REDISCOVER_INTERVAL_S, self._periodic_rebrowse)
+        GLib.timeout_add_seconds(HEARTBEAT_INTERVAL_S, self._heartbeat)
+
+    def _save_config(self):
+        save_config(
+            {
+                "pinned": sorted(self.pinned),
+                "managed": self.managed,
+            }
+        )
+
+    def _start_browser(self):
+        """Start (or restart) the mDNS service browser."""
+        if self.browser:
+            self.browser.cancel()
+        self.browser = ServiceBrowser(self.zc, "_wled._tcp.local.", self.manager)
+
+    def _periodic_rebrowse(self):
+        self._start_browser()
+        return True
+
+    def _on_devices_changed(self):
+        """Called when devices appear/disappear. Activate managed devices."""
+        devices = self.manager.snapshot()
+
+        to_activate = []
+        for d in devices:
+            bri = self.managed.get(d.ui_name)
+            if bri is not None and not d.on:
+                LOG.info(
+                    "Will activate managed device %s (ui=%s) @ %d",
+                    d.name,
+                    d.ui_name,
+                    bri,
+                )
+                to_activate.append((d, bri))
+            elif bri is not None:
+                LOG.debug("Managed device %s already on", d.ui_name)
+
+        if to_activate:
+
+            def activate():
+                for device, bri in to_activate:
+                    device.send_keepalive(bri)
+                GLib.idle_add(self.rebuild_menu)
+
+            threading.Thread(target=activate, daemon=True).start()
+        else:
+            self.rebuild_menu()
+
+    def _heartbeat(self):
+        """Keep-alive for managed devices"""
+        devices = self.manager.snapshot()
+
+        targets = [
+            (d, bri)
+            for d in devices
+            if (bri := self.managed.get(d.ui_name)) is not None and d.on
+        ]
+        if targets:
+            names = ", ".join(f"{d.ui_name}@{b}" for d, b in targets)
+            LOG.info("Heartbeat: %s", names)
+        else:
+            LOG.debug("Heartbeat: no managed+on devices")
+
+        def send_heartbeats():
+            for device, bri in targets:
+                device.send_keepalive(bri)
+
+        if targets:
+            threading.Thread(target=send_heartbeats, daemon=True).start()
+        return True  # keep the timer running
+
+    def _device_markup(self, device: WledDevice, dim: bool = False) -> str:
+        name = GLib.markup_escape_text(device.ui_name)
+        is_managed = device.ui_name in self.managed
+        if is_managed:
+            name = f'<span foreground="{COLOR_MANAGED}">⏲</span> {name}'
+        if dim:
+            name = f'<span foreground="{COLOR_DIM}">{name}</span>'
+        if device.on:
+            bri = round(device.brightness / 255 * 100)
+            return f'<tt><span foreground="{COLOR_ON}">● {bri:3d}%</span></tt>  {name}'
+        return f'<tt><span foreground="{COLOR_OFF}">○     </span></tt>  {name}'
+
+    @staticmethod
+    def _set_markup(item: Gtk.MenuItem, markup: str):
+        label = item.get_child()
+        if isinstance(label, Gtk.Label):
+            label.set_markup(markup)
+
+    def _on_device_click(self, _item, event, device):
+        """Left-click toggles on/off; right-click opens context menu."""
+        if event.button == 3:
+            self._show_context_menu(event, device)
+            return True
+        if event.button != 1:
+            return False
+
+        new_on = not device.on
+        device.on = new_on
+        managed_bri = self.managed.get(device.ui_name)
+
+        # Turning on a managed device: restore managed brightness
+        if new_on and managed_bri is not None:
+            device.brightness = managed_bri
+
+        self._sync_device_item(device)
+
+        def send():
+            if new_on and managed_bri is not None:
+                device.send_keepalive(managed_bri)
+            else:
+                device.set_state(on=new_on)
+            GLib.idle_add(lambda: self._sync_device_item(device))
+
+        threading.Thread(target=send, daemon=True).start()
+        return True  # keep menu open
+
+    def _sync_device_item(self, device):
+        """Update the menu item label for a device."""
+        if item := self.device_items.get(device.name):
+            dim = device.ui_name not in self.pinned
+            self._set_markup(item, self._device_markup(device, dim=dim))
+
+    def _show_context_menu(self, event, device):
+        ctx = Gtk.Menu()
+
+        web_item = Gtk.MenuItem(label="Open Web UI")
+        web_item.connect("activate", lambda _: self._open_web_ui(device))
+        ctx.append(web_item)
+
+        is_managed = device.ui_name in self.managed
+        manage_item = Gtk.MenuItem(
+            label="Stop keep-alive" if is_managed else "Keep alive"
+        )
+        manage_item.connect("activate", lambda _: self._toggle_managed(device))
+        ctx.append(manage_item)
+
+        if not is_managed:
+            ctx.append(Gtk.SeparatorMenuItem())
+            for label, target in [
+                ("Fade to off", 0),
+                ("Fade to 25%", 64),
+                ("Fade to 50%", 128),
+                ("Fade to 75%", 191),
+            ]:
+                mi = Gtk.MenuItem(label=label)
+                mi.connect(
+                    "activate",
+                    lambda _, d=device, t=target: self._start_fade(d, t),
+                )
+                ctx.append(mi)
+
+        ctx.append(Gtk.SeparatorMenuItem())
+
+        is_pinned = device.ui_name in self.pinned
+        pin_item = Gtk.MenuItem(label="Unpin" if is_pinned else "Pin")
+        pin_item.connect("activate", lambda _: self._toggle_pin(device))
+        ctx.append(pin_item)
+
+        ctx.show_all()
+        ctx.popup_at_pointer(event)
+
+    def _toggle_pin(self, device):
+        if device.ui_name in self.pinned:
+            self.pinned.discard(device.ui_name)
+        else:
+            self.pinned.add(device.ui_name)
+        self._save_config()
+        self.rebuild_menu()
+
+    def _toggle_managed(self, device):
+        if device.ui_name in self.managed:
+            del self.managed[device.ui_name]
+        else:
+            self.managed[device.ui_name] = device.brightness
+            # Send first heartbeat immediately if already on
+            if device.on:
+                threading.Thread(
+                    target=lambda: device.send_keepalive(device.brightness),
+                    daemon=True,
+                ).start()
+        self._save_config()
+        self._sync_device_item(device)
+
+    def _start_fade(self, device, target_bri):
+        threading.Thread(
+            target=lambda: device.start_nightlight(target_bri),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _open_web_ui(device: WledDevice):
+        subprocess.run(["xdg-open", device.base_url], check=False)
+
+    def _on_menu_scroll(self, _menu, event):
+        device = self.hovered_device
+        if device is None:
+            return False
+        up = parse_scroll_direction(event)
+        if up is None:
+            return False
+
+        delta = max(round(device.brightness * 0.1), 1)
+        new_bri = device.brightness + (delta if up else -delta)
+        new_bri = clamp_bri(new_bri)
+        device.brightness = new_bri
+        device.on = True
+
+        # Update managed brightness in memory (persisted in debounce callback)
+        if device.ui_name in self.managed:
+            self.managed[device.ui_name] = new_bri
+
+        self._sync_device_item(device)
+
+        self._debounce_brightness(device, new_bri)
+        return True
+
+    def _debounce_brightness(self, device, bri, delay=0.15):
+        """Coalesce rapid scroll events into a single API call + config save."""
+        if timer := self._brightness_timers.get(device.name):
+            timer.cancel()
+        is_managed = device.ui_name in self.managed
+
+        def send():
+            if is_managed:
+                device.send_keepalive(bri)
+                GLib.idle_add(self._save_config)
+            else:
+                device.set_state(on=True, bri=clamp_bri(bri))
+
+        t = threading.Timer(delay, send)
+        t.daemon = True
+        t.start()
+        self._brightness_timers[device.name] = t
+
+    def _make_device_item(self, device: WledDevice, dim: bool = False) -> Gtk.MenuItem:
+        item = Gtk.MenuItem(label="")
+        self._set_markup(item, self._device_markup(device, dim=dim))
+        item.connect(
+            "button-release-event",
+            lambda w, e, d=device: self._on_device_click(w, e, d),
+        )
+        item.connect("select", lambda _, d=device: setattr(self, "hovered_device", d))
+        item.connect("deselect", lambda _: setattr(self, "hovered_device", None))
+        self.device_items[device.name] = item
+        return item
+
+    def _on_menu_show(self, _menu):
+        """Refresh device state when the menu is opened."""
+
+        def do_refresh():
+            devices = self.manager.snapshot()
+            with ThreadPoolExecutor(max_workers=len(devices) or 1) as pool:
+                pool.map(WledDevice.refresh, devices)
+            GLib.idle_add(self._sync_all_items)
+
+        threading.Thread(target=do_refresh, daemon=True).start()
+
+    def _sync_all_items(self):
+        for device_name, item in self.device_items.items():
+            with self.manager.lock:
+                device = next(
+                    (d for d in self.manager.devices.values() if d.name == device_name),
+                    None,
+                )
+            if device:
+                dim = device.ui_name not in self.pinned
+                self._set_markup(item, self._device_markup(device, dim=dim))
+
+    def rebuild_menu(self):
+        menu = Gtk.Menu()
+        menu.connect("scroll-event", self._on_menu_scroll)
+        menu.connect("show", self._on_menu_show)
+        self.device_items.clear()
+        self.hovered_device = None
+
+        all_devices = sorted(self.manager.snapshot(), key=lambda d: d.ui_name)
+
+        pinned = [d for d in all_devices if d.ui_name in self.pinned]
+        others = [d for d in all_devices if d.ui_name not in self.pinned]
+
+        if not pinned and not others:
+            item = Gtk.MenuItem(label="No devices found")
+            item.set_sensitive(False)
+            menu.append(item)
+        elif not pinned:
+            item = Gtk.MenuItem(label="No pinned devices")
+            item.set_sensitive(False)
+            menu.append(item)
+
+        for device in pinned:
+            menu.append(self._make_device_item(device))
+
+        if others:
+            menu.append(Gtk.SeparatorMenuItem())
+            for device in others:
+                menu.append(self._make_device_item(device, dim=True))
+
+        menu.append(Gtk.SeparatorMenuItem())
+        refresh = Gtk.MenuItem(label="Refresh")
+        refresh.connect("activate", lambda _: self._refresh_devices())
+        menu.append(refresh)
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def _refresh_devices(self):
+        def do_refresh():
+            devices = self.manager.snapshot()
+            with ThreadPoolExecutor(max_workers=len(devices) or 1) as pool:
+                pool.map(WledDevice.refresh, devices)
+            GLib.idle_add(self._start_browser)
+            GLib.idle_add(self.rebuild_menu)
+
+        threading.Thread(target=do_refresh, daemon=True).start()
+
+
+def main():
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, Gtk.main_quit)
+
+    manager = DeviceManager()
+    zc = Zeroconf()
+    indicator = WledIndicator(manager, zc)
+    try:
+        Gtk.main()
+    finally:
+        if indicator.browser:
+            indicator.browser.cancel()
+        zc.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+    )
+    main()

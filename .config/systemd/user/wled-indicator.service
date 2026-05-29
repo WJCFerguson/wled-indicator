@@ -1,0 +1,12 @@
+[Unit]
+Description=WLED system tray indicator
+After=graphical-session.target
+Requires=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/wled-indicator
+RestartSec=3
+Restart=always
+
+[Install]
+WantedBy=graphical-session.target
