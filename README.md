@@ -2,39 +2,47 @@
 
 Linux system tray indicator for [WLED](https://kno.wled.ge/) lights.
 
-Discovers WLED lights on the local network and offers quick control
-from a tray menu.
+Discovers WLED lights on the local network and shows a popup window
+from the tray icon.
 
 - **Left-click** a device to toggle on/off
-- **Mouse Scroll** over a device to adjust brightness
-- **Right-click** for a menu to:
+- **Mouse scroll** over a device to adjust brightness
+- **Right-click** for a context menu to:
    * pin/unpin important lights to the top of the list
    * keep-alive: keep a light lit only while this indicator is running
-   * some 1-minute nightlight fades
+   * 1-minute nightlight fades
    * open the Web UI in a browser
 
-Keep-alive is functionality for lights associated with your computer, to keep them lit only while the indicator is running.  They will shut down within a minute when you suspend, shut down, or log out etc..  This is ideal for backlights and downlights on a monitor.
+Keep-alive is for lights associated with your computer — they stay lit
+only while the indicator is running.  They shut down within a minute
+when you suspend, shut down, or log out.  Ideal for monitor backlights
+and downlights.
+
+Uses the [StatusNotifierItem](https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/)
+D-Bus protocol directly (no libappindicator), with a GtkStatusIcon
+fallback for X11 trays (e.g. i3bar).  Works on both X11 and Wayland.
 
 This was created with LLM agent help, but the author is a software engineer, does understand the code, and expects to continue to use and maintain it.  It focuses initially only on my use cases, and has a few rough edges, but requests, suggestions and bugfixes welcome.
 
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) — Python dependencies are handled automatically
-- GTK 3 introspection libraries and AppIndicator typelibs (system packages, see below)
-- A system tray — most DEs have one; on GNOME you may need the
-  [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
+- GTK 3 introspection libraries (system packages, see below)
+- A system tray — built-in on KDE, XFCE, Cinnamon, Budgie; on GNOME
+  you need the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/);
+  on i3/sway the GtkStatusIcon fallback works with i3bar
 
 ```sh
 # Ubuntu/Debian (22.04+)
 sudo apt install libgirepository1.0-dev libcairo2-dev pkg-config \
-    python3-dev gcc gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+    python3-dev gcc gir1.2-gtk-3.0
 
 # Fedora
 sudo dnf install gobject-introspection-devel cairo-gobject-devel \
-    gcc python3-devel gtk3 libayatana-appindicator-gtk3
+    gcc python3-devel gtk3
 
 # Arch
-sudo pacman -S python-gobject gtk3 libappindicator-gtk3
+sudo pacman -S python-gobject gtk3
 ```
 
 > **Note:** The script pins `PyGObject<3.50` because versions >= 3.50

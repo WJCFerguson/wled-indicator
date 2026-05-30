@@ -15,33 +15,40 @@
 """System tray indicator for discovering and controlling WLED lights.
 
 Discovers WLED devices on the local network via mDNS and presents them
-in a system tray menu.  Left-click toggles on/off, scroll wheel adjusts
-brightness.  Right-click opens a context menu to pin/unpin, toggle
-keep-alive, or open the device's web UI.
+in a popup window triggered by clicking the tray icon.  Click a device
+to toggle on/off, scroll over a device to adjust brightness.  Right-click
+opens a context menu to pin/unpin, toggle keep-alive, fade, or open
+the device's web UI.  Scrolling on the tray icon adjusts brightness
+for the last-selected device.
 
-Pinned devices appear at the top of the menu; others below a separator.
+Uses the StatusNotifierItem D-Bus protocol directly (no libappindicator)
+so all GTK events work natively on both X11 and Wayland.
+
+Pinned devices appear at the top of the list; others below a separator.
 
 Keep-alive ("managed") devices have their brightness maintained on a
 30-second heartbeat with a 1-minute WLED nightlight timer — if the
 indicator stops (suspend, logout, crash), the light auto-offs within
-a minute.  Managed state is independent of on/off: clicking off pauses
-heartbeats, clicking on resumes at the managed brightness.  Scroll
-adjusts the managed brightness (persisted).
+a minute.  Managed state is independent of on/off: toggling off pauses
+heartbeats, toggling on resumes at the managed brightness.
 
 Config persists in ~/.config/wled-indicator/config.json.
 
 Prerequisites (system packages, not installed by uv):
   - GTK 3 introspection:  libgirepository1.0-dev libcairo2-dev
                            pkg-config python3-dev gcc gir1.2-gtk-3.0
-  - AppIndicator:          gir1.2-ayatanaappindicator3-0.1
-                           (or gir1.2-appindicator3-0.1)
-  On Ubuntu 22.04:  apt install libgirepository1.0-dev libcairo2-dev
-                    pkg-config python3-dev gcc gir1.2-gtk-3.0
-                    gir1.2-ayatanaappindicator3-0.1
+  - SNI host (tray icon):  gnome-shell-extension-appindicator (GNOME),
+                            or built-in on KDE/XFCE/Cinnamon/Budgie
+  On Ubuntu:  apt install libgirepository1.0-dev libcairo2-dev
+              pkg-config python3-dev gcc gir1.2-gtk-3.0
 
 Usage:
   uv run --script wled-indicator   # or just ./wled-indicator
 """
+
+import warnings
+
+warnings.filterwarnings("ignore", message=".*StatusIcon.*deprecated")
 
 import atexit
 import dataclasses
@@ -54,6 +61,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -66,14 +74,7 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk
-
-try:
-    gi.require_version("AyatanaAppIndicator3", "0.1")
-    from gi.repository import AyatanaAppIndicator3 as AppIndicator
-except (ValueError, ImportError):
-    gi.require_version("AppIndicator3", "0.1")
-    from gi.repository import AppIndicator3 as AppIndicator
+from gi.repository import Gdk, Gio, GLib, Gtk  # type: ignore[attr-defined]
 
 LOG = logging.getLogger(__name__)
 API_TIMEOUT = 2
@@ -111,8 +112,30 @@ DARK_CSS = b"""
     menuitem:hover {
         background-color: #404040;
     }
-    separator {
+    .wled-popup {
+        background-color: #2d2d2d;
+        border: 1px solid #555555;
+        padding: 6px 0;
+    }
+    .wled-row {
+        background-color: #2d2d2d;
+        color: #eeeeee;
+    }
+    .wled-row.hover {
+        background-color: #404040;
+    }
+    .wled-separator {
         background-color: #444444;
+        min-height: 1px;
+        margin: 4px 8px;
+    }
+    .wled-action {
+        background-color: #2d2d2d;
+        color: #aaaaaa;
+    }
+    .wled-action.hover {
+        background-color: #404040;
+        color: #eeeeee;
     }
 """
 
@@ -178,7 +201,9 @@ class WledDevice:
     ui_name: str = ""
     on: bool = False
     brightness: int = 128
-    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     def __post_init__(self):
         if not self.ui_name:
@@ -286,15 +311,205 @@ class DeviceManager(ServiceListener):
         LOG.info("Discovered %s (%s) at %s:%d", device.ui_name, mdns_name, host, port)
         self.on_change()
 
-    def update_service(self, _zc: Zeroconf, _type: str, _name: str):
+    def update_service(self, zc: Zeroconf, type_: str, name: str):  # noqa: ARG002
         pass  # address changes are rare; refresh handles state
 
-    def remove_service(self, _zc: Zeroconf, _type: str, name: str):
+    def remove_service(self, zc: Zeroconf, type_: str, name: str):
         with self.lock:
             removed = self.devices.pop(name, None)
         if removed:
             LOG.info("Lost %s", removed.name)
             self.on_change()
+
+
+REDISCOVER_INTERVAL_S = 120
+HEARTBEAT_INTERVAL_S = 30
+
+# ---------------------------------------------------------------------------
+# StatusNotifierItem D-Bus tray icon
+# ---------------------------------------------------------------------------
+
+SNI_XML = """<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <method name="Activate">
+      <arg type="i" name="x" direction="in"/>
+      <arg type="i" name="y" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg type="i" name="x" direction="in"/>
+      <arg type="i" name="y" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg type="i" name="delta" direction="in"/>
+      <arg type="s" name="orientation" direction="in"/>
+    </method>
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <signal name="NewIcon"/>
+    <signal name="NewStatus">
+      <arg type="s"/>
+    </signal>
+  </interface>
+</node>"""
+
+
+class TrayIcon:
+    """Tray icon with SNI (StatusNotifierItem) and GtkStatusIcon fallback.
+
+    Tries the modern org.kde.StatusNotifierItem D-Bus protocol first
+    (works on GNOME Shell, KDE, XFCE 4.16+, etc.).  If no SNI watcher
+    is available (e.g. i3bar, GNOME Flashback), falls back to the
+    legacy GtkStatusIcon XEmbed protocol.  If an SNI watcher appears
+    later, registers there and hides the GtkStatusIcon to avoid duplicates.
+
+    Calls *on_activate* with (x, y) on left-click and *on_scroll* with
+    (delta, orientation) on scroll.
+    """
+
+    WATCHER_BUS_NAME = "org.kde.StatusNotifierWatcher"
+    WATCHER_PATH = "/StatusNotifierWatcher"
+
+    def __init__(
+        self,
+        icon_name: str,
+        icon_theme_path: str,
+        on_activate: Callable[[int, int], None],
+        on_scroll: Callable[[int, str], None],
+    ):
+        self._on_activate = on_activate
+        self._on_scroll = on_scroll
+        self._icon_path = os.path.join(icon_theme_path, f"{icon_name}.png")
+        self._props: dict[str, GLib.Variant] = {
+            "Category": GLib.Variant("s", "Hardware"),
+            "Id": GLib.Variant("s", "wled-indicator"),
+            "Title": GLib.Variant("s", "WLED Indicator"),
+            "Status": GLib.Variant("s", "Active"),
+            "IconName": GLib.Variant("s", icon_name),
+            "IconThemePath": GLib.Variant("s", icon_theme_path),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", "/NO_DBUSMENU"),
+        }
+
+        # -- SNI setup (non-blocking) --
+        self._bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
+
+        self._bus.register_object(
+            "/StatusNotifierItem",
+            node.interfaces[0],
+            self._on_sni_method,
+            self._on_sni_get_prop,
+            None,
+        )
+
+        self._bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self._bus.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "RequestName",
+            GLib.Variant("(su)", (self._bus_name, 0)),
+            GLib.VariantType("(u)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
+
+        # -- GtkStatusIcon fallback (XEmbed, works on X11 with i3bar etc.) --
+        self._status_icon = Gtk.StatusIcon()
+        self._status_icon.set_from_file(self._icon_path)
+        self._status_icon.set_tooltip_text("WLED Indicator")
+        self._status_icon.connect("activate", self._on_status_activate)
+        self._status_icon.connect("scroll-event", self._on_status_scroll)
+
+        # Try SNI registration; watch for watcher to appear later
+        if self._try_register():
+            self._status_icon.set_visible(False)
+        else:
+            LOG.info(
+                "SNI watcher not available, using GtkStatusIcon fallback. "
+                "Will register SNI if watcher appears later."
+            )
+        self._bus.signal_subscribe(
+            "org.freedesktop.DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+            "/org/freedesktop/DBus",
+            self.WATCHER_BUS_NAME,
+            Gio.DBusSignalFlags.NONE,
+            self._on_watcher_owner_changed,
+        )
+
+    def _try_register(self) -> bool:
+        """Try to register with the StatusNotifierWatcher. Returns True on success."""
+        try:
+            self._bus.call_sync(
+                self.WATCHER_BUS_NAME,
+                self.WATCHER_PATH,
+                self.WATCHER_BUS_NAME,
+                "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (self._bus_name,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+            LOG.info("Registered SNI as %s", self._bus_name)
+            self._status_icon.set_visible(False)
+            return True
+        except GLib.Error:
+            return False
+
+    def _on_watcher_owner_changed(self, _conn, _sender, _path, _iface, _sig, params):
+        _name, _old_owner, new_owner = params.unpack()
+        if new_owner:
+            LOG.info("StatusNotifierWatcher appeared, registering…")
+            self._try_register()
+        else:
+            # Watcher disappeared — show GtkStatusIcon fallback
+            LOG.info("StatusNotifierWatcher gone, falling back to GtkStatusIcon")
+            self._status_icon.set_visible(True)
+
+    # -- SNI D-Bus handlers --
+
+    def _on_sni_method(self, _conn, _sender, _path, _iface, method, params, invocation):
+        if method == "Activate":
+            x, y = params.unpack()
+            self._on_activate(x, y)
+        elif method == "Scroll":
+            delta, orientation = params.unpack()
+            self._on_scroll(delta, orientation)
+        invocation.return_value(None)
+
+    def _on_sni_get_prop(self, _conn, _sender, _path, _iface, prop):
+        return self._props.get(prop)
+
+    # -- GtkStatusIcon handlers --
+
+    def _on_status_activate(self, status_icon):
+        ok, _screen, area, _orient = status_icon.get_geometry()
+        if ok:
+            x, y = area.x, area.y + area.height
+        else:
+            x, y = 0, 0
+        self._on_activate(x, y)
+
+    def _on_status_scroll(self, _status_icon, event):
+        if event.direction == Gdk.ScrollDirection.UP:
+            self._on_scroll(1, "vertical")
+        elif event.direction == Gdk.ScrollDirection.DOWN:
+            self._on_scroll(-1, "vertical")
+
+
+# ---------------------------------------------------------------------------
+# Scroll direction helper (for GTK scroll events on the popup window)
+# ---------------------------------------------------------------------------
 
 
 def parse_scroll_direction(event: Gdk.Event) -> bool | None:
@@ -312,8 +527,9 @@ def parse_scroll_direction(event: Gdk.Event) -> bool | None:
     return None
 
 
-REDISCOVER_INTERVAL_S = 120
-HEARTBEAT_INTERVAL_S = 30
+# ---------------------------------------------------------------------------
+# Main indicator UI
+# ---------------------------------------------------------------------------
 
 
 class WledIndicator:
@@ -321,9 +537,11 @@ class WledIndicator:
         self.manager = manager
         self.zc = zc
         self.browser: ServiceBrowser | None = None
-        self.hovered_device: WledDevice | None = None
-        self.device_items: dict[str, Gtk.MenuItem] = {}
+        self.active_device: WledDevice | None = None
         self._brightness_timers: dict[str, threading.Timer] = {}
+        self._last_refresh: float = 0.0
+        self._ctx_menu_active = False
+        self._device_labels: dict[str, Gtk.Label] = {}
 
         cfg = load_config()
         self.pinned: set[str] = set(cfg.get("pinned", []))
@@ -331,18 +549,215 @@ class WledIndicator:
 
         apply_dark_css()
 
-        self.indicator = AppIndicator.Indicator.new(
-            "wled-indicator",
-            "wled",
-            AppIndicator.IndicatorCategory.HARDWARE,
+        # Popup window (shown/hidden on tray icon click)
+        self.popup = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self.popup.set_decorated(False)
+        self.popup.set_skip_taskbar_hint(True)
+        self.popup.set_skip_pager_hint(True)
+        self.popup.set_resizable(False)
+        self.popup.set_keep_above(True)
+        self.popup.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
+        self.popup.get_style_context().add_class("wled-popup")
+        self.popup.connect("focus-out-event", self._on_popup_focus_out)
+        self.popup.connect("key-press-event", self._on_popup_key)
+        self._popup_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.popup.add(self._popup_box)
+
+        # Tray icon via raw SNI D-Bus
+        icon_theme_path = generate_icon_theme_dir()
+        self.tray = TrayIcon(
+            icon_name="wled",
+            icon_theme_path=icon_theme_path,
+            on_activate=lambda x, y: GLib.idle_add(self._toggle_popup, x, y),
+            on_scroll=lambda d, o: GLib.idle_add(self._on_tray_scroll, d, o),
         )
-        self.indicator.set_icon_theme_path(generate_icon_theme_dir())
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
         self._start_browser()
-        self.rebuild_menu()
         manager.on_change = lambda: GLib.idle_add(self._on_devices_changed)
         GLib.timeout_add_seconds(REDISCOVER_INTERVAL_S, self._periodic_rebrowse)
         GLib.timeout_add_seconds(HEARTBEAT_INTERVAL_S, self._heartbeat)
+
+    # -- Popup window management --
+
+    def _toggle_popup(self, x: int, y: int):
+        if self.popup.get_visible():
+            self.popup.hide()
+        else:
+            self._rebuild_popup()
+            self.popup.show_all()
+            # Clamp position so the popup stays on-screen
+            display = Gdk.Display.get_default()
+            monitor = display.get_monitor_at_point(x, y)
+            geo = monitor.get_workarea()
+            w, h = self.popup.get_size()
+            x = min(x, geo.x + geo.width - w)
+            y = min(y, geo.y + geo.height - h)
+            x = max(x, geo.x)
+            y = max(y, geo.y)
+            self.popup.move(x, y)
+            self.popup.present()
+            self._maybe_refresh()
+
+    def _on_popup_focus_out(self, _widget, _event):
+        if not self._ctx_menu_active:
+            self.popup.hide()
+
+    def _on_popup_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.popup.hide()
+            return True
+        return False
+
+    def _maybe_refresh(self):
+        """Refresh device state in background, throttled."""
+        now = time.monotonic()
+        if now - self._last_refresh < 2.0:
+            return
+        self._last_refresh = now
+
+        def do_refresh():
+            devices = self.manager.snapshot()
+            with ThreadPoolExecutor(max_workers=len(devices) or 1) as pool:
+                pool.map(WledDevice.refresh, devices)
+            GLib.idle_add(self._rebuild_popup_if_visible)
+
+        threading.Thread(target=do_refresh, daemon=True).start()
+
+    def _rebuild_popup_if_visible(self):
+        if self.popup.get_visible():
+            self._rebuild_popup()
+            self.popup.show_all()
+
+    def _rebuild_popup(self):
+        for child in self._popup_box.get_children():
+            self._popup_box.remove(child)
+        self._device_labels.clear()
+
+        all_devices = sorted(self.manager.snapshot(), key=lambda d: d.ui_name)
+        pinned = [d for d in all_devices if d.ui_name in self.pinned]
+        others = [d for d in all_devices if d.ui_name not in self.pinned]
+
+        if not pinned and not others:
+            lbl = Gtk.Label(label="No devices found")
+            lbl.set_sensitive(False)
+            self._popup_box.pack_start(lbl, False, False, 4)
+        elif not pinned:
+            lbl = Gtk.Label(label="No pinned devices")
+            lbl.set_sensitive(False)
+            self._popup_box.pack_start(lbl, False, False, 4)
+
+        for device in pinned:
+            self._popup_box.pack_start(self._make_device_row(device), False, False, 0)
+
+        if others:
+            sep = Gtk.Separator()
+            sep.get_style_context().add_class("wled-separator")
+            self._popup_box.pack_start(sep, False, False, 0)
+            for device in others:
+                self._popup_box.pack_start(
+                    self._make_device_row(device, dim=True), False, False, 0
+                )
+
+        sep = Gtk.Separator()
+        sep.get_style_context().add_class("wled-separator")
+        self._popup_box.pack_start(sep, False, False, 0)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        actions.pack_start(
+            self._make_action("Refresh", self._refresh_devices), True, True, 0
+        )
+        actions.pack_start(self._make_action("Quit", Gtk.main_quit), True, True, 0)
+        self._popup_box.pack_start(actions, False, False, 0)
+
+    @staticmethod
+    def _make_hoverable(css_class: str) -> Gtk.EventBox:
+        """Create an EventBox with hover highlight and a styled label inside."""
+        row = Gtk.EventBox()
+        row.set_visible_window(True)
+        row.get_style_context().add_class(css_class)
+        row.connect(
+            "enter-notify-event",
+            lambda w, _: w.get_style_context().add_class("hover"),
+        )
+        row.connect(
+            "leave-notify-event",
+            lambda w, _: w.get_style_context().remove_class("hover"),
+        )
+        return row
+
+    @staticmethod
+    def _padded_label(markup: str = "", xalign: float = 0) -> Gtk.Label:
+        lbl = Gtk.Label()
+        if markup:
+            lbl.set_markup(markup)
+        lbl.set_xalign(xalign)
+        lbl.set_margin_start(8)
+        lbl.set_margin_end(8)
+        lbl.set_margin_top(3)
+        lbl.set_margin_bottom(3)
+        return lbl
+
+    def _make_device_row(self, device: WledDevice, dim: bool = False) -> Gtk.EventBox:
+        row = self._make_hoverable("wled-row")
+        row.add_events(
+            Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
+        )
+
+        label = self._padded_label(self._device_markup(device, dim=dim))
+        row.add(label)
+        self._device_labels[device.name] = label
+
+        row.connect(
+            "button-release-event",
+            lambda _w, e, d=device: self._on_row_click(e, d),
+        )
+        row.connect(
+            "scroll-event",
+            lambda _w, e, d=device: self._on_row_scroll(e, d),
+        )
+        row.connect(
+            "enter-notify-event",
+            lambda _w, _e, d=device: setattr(self, "active_device", d),
+        )
+        return row
+
+    def _make_action(self, text: str, callback: Callable) -> Gtk.EventBox:
+        row = self._make_hoverable("wled-action")
+        row.add(self._padded_label(text, xalign=0.5))
+        row.connect("button-release-event", lambda *_: callback())
+        return row
+
+    # -- Row event handlers --
+
+    def _on_row_click(self, event, device: WledDevice):
+        if event.button == 1:
+            self._toggle_device(device)
+        elif event.button == 3:
+            self._show_context_menu(event, device)
+        return True
+
+    def _on_row_scroll(self, event, device: WledDevice):
+        up = parse_scroll_direction(event)
+        if up is None:
+            return False
+        self.active_device = device
+        self._adjust_brightness(device, up)
+        # Update label in-place for instant feedback
+        if lbl := self._device_labels.get(device.name):
+            dim = device.ui_name not in self.pinned
+            lbl.set_markup(self._device_markup(device, dim=dim))
+        return True
+
+    def _on_tray_scroll(self, delta: int, orientation: str):
+        """Scroll on the tray icon adjusts the last-selected device."""
+        device = self.active_device
+        if device is None or orientation != "vertical":
+            return
+        self._adjust_brightness(device, up=delta > 0)
+
+    # -- Config --
 
     def _save_config(self):
         save_config(
@@ -351,6 +766,8 @@ class WledIndicator:
                 "managed": self.managed,
             }
         )
+
+    # -- mDNS --
 
     def _start_browser(self):
         """Start (or restart) the mDNS service browser."""
@@ -385,11 +802,13 @@ class WledIndicator:
             def activate():
                 for device, bri in to_activate:
                     device.send_keepalive(bri)
-                GLib.idle_add(self.rebuild_menu)
+                GLib.idle_add(self._rebuild_popup_if_visible)
 
             threading.Thread(target=activate, daemon=True).start()
         else:
-            self.rebuild_menu()
+            self._rebuild_popup_if_visible()
+
+    # -- Heartbeat --
 
     def _heartbeat(self):
         """Keep-alive for managed devices"""
@@ -414,6 +833,8 @@ class WledIndicator:
             threading.Thread(target=send_heartbeats, daemon=True).start()
         return True  # keep the timer running
 
+    # -- Device markup --
+
     def _device_markup(self, device: WledDevice, dim: bool = False) -> str:
         name = GLib.markup_escape_text(device.ui_name)
         is_managed = device.ui_name in self.managed
@@ -426,47 +847,76 @@ class WledIndicator:
             return f'<tt><span foreground="{COLOR_ON}">● {bri:3d}%</span></tt>  {name}'
         return f'<tt><span foreground="{COLOR_OFF}">○     </span></tt>  {name}'
 
-    @staticmethod
-    def _set_markup(item: Gtk.MenuItem, markup: str):
-        label = item.get_child()
-        if isinstance(label, Gtk.Label):
-            label.set_markup(markup)
+    # -- Device actions --
 
-    def _on_device_click(self, _item, event, device):
-        """Left-click toggles on/off; right-click opens context menu."""
-        if event.button == 3:
-            self._show_context_menu(event, device)
-            return True
-        if event.button != 1:
-            return False
+    def _toggle_device(self, device: WledDevice):
+        """Toggle a device on/off."""
+        with device.lock:
+            new_on = not device.on
+            device.on = new_on
+            managed_bri = self.managed.get(device.ui_name)
+            if new_on and managed_bri is not None:
+                device.brightness = managed_bri
 
-        new_on = not device.on
-        device.on = new_on
-        managed_bri = self.managed.get(device.ui_name)
-
-        # Turning on a managed device: restore managed brightness
-        if new_on and managed_bri is not None:
-            device.brightness = managed_bri
-
-        self._sync_device_item(device)
+        self._rebuild_popup_if_visible()
 
         def send():
             if new_on and managed_bri is not None:
                 device.send_keepalive(managed_bri)
             else:
                 device.set_state(on=new_on)
-            GLib.idle_add(lambda: self._sync_device_item(device))
+            GLib.idle_add(self._rebuild_popup_if_visible)
 
         threading.Thread(target=send, daemon=True).start()
-        return True  # keep menu open
 
-    def _sync_device_item(self, device):
-        """Update the menu item label for a device."""
-        if item := self.device_items.get(device.name):
-            dim = device.ui_name not in self.pinned
-            self._set_markup(item, self._device_markup(device, dim=dim))
+    def _adjust_brightness(self, device: WledDevice, up: bool):
+        """Step brightness up or down by ~10%."""
+        with device.lock:
+            delta = max(round(device.brightness * 0.1), 1)
+            new_bri = clamp_bri(device.brightness + (delta if up else -delta))
+            device.brightness = new_bri
+            device.on = True
 
-    def _show_context_menu(self, event, device):
+        if device.ui_name in self.managed:
+            self.managed[device.ui_name] = new_bri
+
+        self._debounce_brightness(device, new_bri)
+
+    def _toggle_pin(self, device: WledDevice):
+        if device.ui_name in self.pinned:
+            self.pinned.discard(device.ui_name)
+        else:
+            self.pinned.add(device.ui_name)
+        self._save_config()
+        self._rebuild_popup_if_visible()
+
+    def _toggle_managed(self, device: WledDevice):
+        if device.ui_name in self.managed:
+            del self.managed[device.ui_name]
+        else:
+            self.managed[device.ui_name] = device.brightness
+            if device.on:
+                threading.Thread(
+                    target=lambda: device.send_keepalive(device.brightness),
+                    daemon=True,
+                ).start()
+        self._save_config()
+        self._rebuild_popup_if_visible()
+
+    def _start_fade(self, device: WledDevice, target_bri: int):
+        threading.Thread(
+            target=lambda: device.start_nightlight(target_bri),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _open_web_ui(device: WledDevice):
+        subprocess.run(["xdg-open", device.base_url], check=False)
+
+    # -- Context menu (right-click on a device row) --
+
+    def _show_context_menu(self, event, device: WledDevice):
+        self._ctx_menu_active = True
         ctx = Gtk.Menu()
 
         web_item = Gtk.MenuItem(label="Open Web UI")
@@ -502,65 +952,13 @@ class WledIndicator:
         pin_item.connect("activate", lambda _: self._toggle_pin(device))
         ctx.append(pin_item)
 
+        ctx.connect("deactivate", lambda _: setattr(self, "_ctx_menu_active", False))
         ctx.show_all()
         ctx.popup_at_pointer(event)
 
-    def _toggle_pin(self, device):
-        if device.ui_name in self.pinned:
-            self.pinned.discard(device.ui_name)
-        else:
-            self.pinned.add(device.ui_name)
-        self._save_config()
-        self.rebuild_menu()
+    # -- Brightness debounce --
 
-    def _toggle_managed(self, device):
-        if device.ui_name in self.managed:
-            del self.managed[device.ui_name]
-        else:
-            self.managed[device.ui_name] = device.brightness
-            # Send first heartbeat immediately if already on
-            if device.on:
-                threading.Thread(
-                    target=lambda: device.send_keepalive(device.brightness),
-                    daemon=True,
-                ).start()
-        self._save_config()
-        self._sync_device_item(device)
-
-    def _start_fade(self, device, target_bri):
-        threading.Thread(
-            target=lambda: device.start_nightlight(target_bri),
-            daemon=True,
-        ).start()
-
-    @staticmethod
-    def _open_web_ui(device: WledDevice):
-        subprocess.run(["xdg-open", device.base_url], check=False)
-
-    def _on_menu_scroll(self, _menu, event):
-        device = self.hovered_device
-        if device is None:
-            return False
-        up = parse_scroll_direction(event)
-        if up is None:
-            return False
-
-        delta = max(round(device.brightness * 0.1), 1)
-        new_bri = device.brightness + (delta if up else -delta)
-        new_bri = clamp_bri(new_bri)
-        device.brightness = new_bri
-        device.on = True
-
-        # Update managed brightness in memory (persisted in debounce callback)
-        if device.ui_name in self.managed:
-            self.managed[device.ui_name] = new_bri
-
-        self._sync_device_item(device)
-
-        self._debounce_brightness(device, new_bri)
-        return True
-
-    def _debounce_brightness(self, device, bri, delay=0.15):
+    def _debounce_brightness(self, device: WledDevice, bri: int, delay: float = 0.15):
         """Coalesce rapid scroll events into a single API call + config save."""
         if timer := self._brightness_timers.get(device.name):
             timer.cancel()
@@ -578,79 +976,7 @@ class WledIndicator:
         t.start()
         self._brightness_timers[device.name] = t
 
-    def _make_device_item(self, device: WledDevice, dim: bool = False) -> Gtk.MenuItem:
-        item = Gtk.MenuItem(label="")
-        self._set_markup(item, self._device_markup(device, dim=dim))
-        item.connect(
-            "button-release-event",
-            lambda w, e, d=device: self._on_device_click(w, e, d),
-        )
-        item.connect("select", lambda _, d=device: setattr(self, "hovered_device", d))
-        item.connect("deselect", lambda _: setattr(self, "hovered_device", None))
-        self.device_items[device.name] = item
-        return item
-
-    def _on_menu_show(self, _menu):
-        """Refresh device state when the menu is opened."""
-
-        def do_refresh():
-            devices = self.manager.snapshot()
-            with ThreadPoolExecutor(max_workers=len(devices) or 1) as pool:
-                pool.map(WledDevice.refresh, devices)
-            GLib.idle_add(self._sync_all_items)
-
-        threading.Thread(target=do_refresh, daemon=True).start()
-
-    def _sync_all_items(self):
-        for device_name, item in self.device_items.items():
-            with self.manager.lock:
-                device = next(
-                    (d for d in self.manager.devices.values() if d.name == device_name),
-                    None,
-                )
-            if device:
-                dim = device.ui_name not in self.pinned
-                self._set_markup(item, self._device_markup(device, dim=dim))
-
-    def rebuild_menu(self):
-        menu = Gtk.Menu()
-        menu.connect("scroll-event", self._on_menu_scroll)
-        menu.connect("show", self._on_menu_show)
-        self.device_items.clear()
-        self.hovered_device = None
-
-        all_devices = sorted(self.manager.snapshot(), key=lambda d: d.ui_name)
-
-        pinned = [d for d in all_devices if d.ui_name in self.pinned]
-        others = [d for d in all_devices if d.ui_name not in self.pinned]
-
-        if not pinned and not others:
-            item = Gtk.MenuItem(label="No devices found")
-            item.set_sensitive(False)
-            menu.append(item)
-        elif not pinned:
-            item = Gtk.MenuItem(label="No pinned devices")
-            item.set_sensitive(False)
-            menu.append(item)
-
-        for device in pinned:
-            menu.append(self._make_device_item(device))
-
-        if others:
-            menu.append(Gtk.SeparatorMenuItem())
-            for device in others:
-                menu.append(self._make_device_item(device, dim=True))
-
-        menu.append(Gtk.SeparatorMenuItem())
-        refresh = Gtk.MenuItem(label="Refresh")
-        refresh.connect("activate", lambda _: self._refresh_devices())
-        menu.append(refresh)
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", lambda _: Gtk.main_quit())
-        menu.append(quit_item)
-
-        menu.show_all()
-        self.indicator.set_menu(menu)
+    # -- Refresh --
 
     def _refresh_devices(self):
         def do_refresh():
@@ -658,7 +984,7 @@ class WledIndicator:
             with ThreadPoolExecutor(max_workers=len(devices) or 1) as pool:
                 pool.map(WledDevice.refresh, devices)
             GLib.idle_add(self._start_browser)
-            GLib.idle_add(self.rebuild_menu)
+            GLib.idle_add(self._rebuild_popup_if_visible)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
